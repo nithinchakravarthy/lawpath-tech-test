@@ -1,0 +1,2 @@
+The project is a serverless application built with the Serverless Framework, designed to run on AWS Lambda and interact with various AWS services such as DynamoDB, S3, and SNS. It includes several Lambda functions for event ingestion, recommendation generation, and background processing using SNS triggers. The application is configured to work with LocalStack for local development and testing, allowing developers to simulate AWS services on their local machines.
+The 2 useful files are run.sh and test.sh.

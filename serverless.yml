@@ -1,0 +1,198 @@
+service: lawpath-tech-test
+frameworkVersion: '>=4.0.0'
+
+plugins:
+  - serverless-localstack
+
+provider:
+  logRetentionInDays: 7
+  name: aws
+  runtime: nodejs18.x
+  stage: dev4                # new stage to dodge stuck resources
+  region: us-east-1
+  versionFunctions: false
+
+  # Shared env (self-referenced below)
+  environment:
+    AWS_ENDPOINT: http://localstack-main:4566
+    AWS_EC2_METADATA_DISABLED: "true"
+    TABLE_NAME: EventsTable-${sls:stage}
+    CACHE_TABLE: RecsCache-${sls:stage}
+    USER_INDEX: userId-index
+    MIN_SCORE: "0.0"
+    MAX_RESULTS: "5"
+    QDRANT_COLLECTION: "events"
+    QDRANT_URL: http://qdrant:6333
+    TOPIC_NAME: events-topic-${sls:stage}
+    TOPIC_ARN: arn:aws:sns:us-east-1:000000000000:events-topic-${sls:stage}
+    BUCKET_NAME: events-bucket-${sls:stage}
+    LS_HOST: localstack-main
+    STAGE: ${sls:stage}
+    SERVICE_NAME: ${self:service}
+
+  # We’ll do CORS in Lambda responses; avoid API-level CORS (avoids OPTIONS errors)
+  apiGateway:
+    shouldStartNameWithService: true
+
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+          Resource: "*"
+        - Effect: Allow
+          Action:
+            - sns:Publish
+            - sns:GetTopicAttributes
+            - sns:CreateTopic
+            - sns:Subscribe
+          Resource: "*"
+        - Effect: Allow
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:GetItem
+            - dynamodb:UpdateItem
+            - dynamodb:Query
+            - dynamodb:Scan
+            - dynamodb:DescribeTable
+          Resource: "*"
+        - Effect: Allow
+          Action:
+            - s3:PutObject
+          Resource: "*"
+
+package:
+  individually: false
+  patterns:
+    - lambdas/**/*.js
+    - node_modules/**
+    - '!**/*.test.js'
+    - '!node_modules/aws-sdk/**'
+
+functions:
+  # POST /events (REST API)
+  eventIngestion:
+    handler: lambdas/eventIngestion.handler 
+    events:
+      - http:
+          path: events
+          method: post
+          cors: false
+    environment:
+      TOPIC_NAME: ${self:provider.environment.TOPIC_NAME}
+      TOPIC_ARN: ${self:provider.environment.TOPIC_ARN}
+    onError: arn:aws:sns:${self:provider.region}:000000000000:errors-${sls:stage}
+
+
+  # GET /recommendations (REST API)
+  recommendation:
+    handler: lambdas/recommendation.handler      # expects ./recommendation.js (your working file)
+    events:
+      - http:
+          path: recommendations
+          method: get
+          cors: false
+    environment:
+      RECS_MODE: fallback
+
+  # SNS -> Dynamo
+  dynamoWorker:
+    handler: lambdas/dynamoWorker.handler
+    events:
+      - sns: ${self:provider.environment.TOPIC_NAME}
+    environment:
+      TABLE_NAME: ${self:provider.environment.TABLE_NAME}
+    maximumRetryAttempts: 2
+
+  # SNS -> S3
+  s3Worker:
+    handler: lambdas/s3Worker.handler
+    events:
+      - sns: ${self:provider.environment.TOPIC_NAME}
+    environment:
+      BUCKET_NAME: ${self:provider.environment.BUCKET_NAME}
+
+  # SNS -> Qdrant
+  vectorWorker:
+    handler: lambdas/vector-worker.handler
+    events:
+      - sns: ${self:provider.environment.TOPIC_NAME}
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: events
+  
+  health:
+    handler: lambdas/health.handler
+    events:
+      - http:
+          path: health
+          method: get
+
+custom:
+  localstack:
+    stages: [dev4]
+    host: http://localhost
+    edgePort: 4566
+    autostart: false
+    lambda:
+      mountCode: false
+
+resources:
+  Resources:
+
+    EventsTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:provider.environment.TOPIC_NAME}
+
+    EventsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: EventsTable-${sls:stage}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+          - AttributeName: userId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        GlobalSecondaryIndexes:
+          - IndexName: userId-index
+            KeySchema: [{ AttributeName: userId, KeyType: HASH }]
+            Projection: { ProjectionType: ALL }
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true
+
+    RecsCacheTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.CACHE_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: userId
+            AttributeType: S
+          - AttributeName: lastEventId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: userId
+            KeyType: HASH
+          - AttributeName: lastEventId
+            KeyType: RANGE
+
+    EventsBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:provider.environment.BUCKET_NAME}
+
+  Outputs:
+    # REST API (v1) doesn’t expose URL in outputs by default; we’ll derive after deploy.
+    ServiceName:
+      Value: ${self:service}
+    StageName:
+      Value: ${sls:stage}
